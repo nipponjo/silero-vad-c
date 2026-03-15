@@ -1,0 +1,1574 @@
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200112L
+#endif
+
+#include "silero_vad.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#if defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#include <arm_neon.h>
+#endif
+
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#define silero_vad_win_aligned_malloc __mingw_aligned_malloc
+#define silero_vad_win_aligned_free __mingw_aligned_free
+#else
+#define silero_vad_win_aligned_malloc _aligned_malloc
+#define silero_vad_win_aligned_free _aligned_free
+#endif
+
+static int silero_vad_has_null_weights(const SileroVadWeights *weights) {
+  return weights == NULL ||
+         weights->conv1_weight == NULL ||
+         weights->conv1_bias == NULL ||
+         weights->conv2_weight == NULL ||
+         weights->conv2_bias == NULL ||
+         weights->conv3_weight == NULL ||
+         weights->conv3_bias == NULL ||
+         weights->conv4_weight == NULL ||
+         weights->conv4_bias == NULL ||
+         weights->lstm_weight_ih == NULL ||
+         weights->lstm_weight_hh == NULL ||
+         weights->lstm_bias_ih == NULL ||
+         weights->lstm_bias_hh == NULL ||
+         weights->final_conv_weight == NULL ||
+         weights->final_conv_bias == NULL;
+}
+
+static int silero_vad_reflect_index(int index, size_t length) {
+  int last;
+
+  if (length == 0 || length == 1) {
+    return 0;
+  }
+
+  last = (int)length - 1;
+  while (index < 0 || index > last) {
+    if (index < 0) {
+      index = -index;
+    } else {
+      index = 2 * last - index;
+    }
+  }
+
+  return index;
+}
+
+static void silero_vad_reflect_pad_right(const float *input,
+                                         size_t input_frames,
+                                         size_t right_pad,
+                                         float *output) {
+  size_t i;
+
+  for (i = 0; i < input_frames; ++i) {
+    output[i] = input[i];
+  }
+
+  for (i = 0; i < right_pad; ++i) {
+    output[input_frames + i] = input[silero_vad_reflect_index((int)(input_frames + i), input_frames)];
+  }
+}
+
+static void *silero_vad_aligned_calloc(size_t count, size_t size) {
+  const size_t alignment = 32;
+  const size_t total = count * size;
+  void *ptr;
+
+  if (count == 0 || size == 0) {
+    return NULL;
+  }
+
+#if defined(_WIN32)
+  ptr = silero_vad_win_aligned_malloc(total, alignment);
+  if (ptr != NULL) {
+    memset(ptr, 0, total);
+  }
+  return ptr;
+#else
+  ptr = NULL;
+  if (posix_memalign(&ptr, alignment, total) != 0) {
+    return NULL;
+  }
+  memset(ptr, 0, total);
+  return ptr;
+#endif
+}
+
+static void silero_vad_aligned_free(void *ptr) {
+  if (ptr == NULL) {
+    return;
+  }
+
+#if defined(_WIN32)
+  silero_vad_win_aligned_free(ptr);
+#else
+  free(ptr);
+#endif
+}
+
+#if defined(__AVX2__)
+static float silero_vad_hsum256_ps(__m256 v) {
+  __m128 low = _mm256_castps256_ps128(v);
+  __m128 high = _mm256_extractf128_ps(v, 1);
+  __m128 sum = _mm_add_ps(low, high);
+  __m128 shuf = _mm_movehdup_ps(sum);
+  sum = _mm_add_ps(sum, shuf);
+  shuf = _mm_movehl_ps(shuf, sum);
+  sum = _mm_add_ss(sum, shuf);
+  return _mm_cvtss_f32(sum);
+}
+#endif
+
+#if defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+static float silero_vad_hsum128_ps(float32x4_t v) {
+#if defined(__aarch64__)
+  return vaddvq_f32(v);
+#else
+  float tmp[4];
+  vst1q_f32(tmp, v);
+  return tmp[0] + tmp[1] + tmp[2] + tmp[3];
+#endif
+}
+#endif
+
+static float silero_vad_dot_f32(const float *a, const float *b, size_t count) {
+  size_t i = 0;
+  float sum = 0.0f;
+
+#if defined(__AVX2__)
+  __m256 acc = _mm256_setzero_ps();
+  for (; i + 8 <= count; i += 8) {
+    const __m256 va = _mm256_loadu_ps(a + i);
+    const __m256 vb = _mm256_loadu_ps(b + i);
+    acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+  }
+  sum = silero_vad_hsum256_ps(acc);
+#elif defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  for (; i + 4 <= count; i += 4) {
+    const float32x4_t va = vld1q_f32(a + i);
+    const float32x4_t vb = vld1q_f32(b + i);
+    acc = vmlaq_f32(acc, va, vb);
+  }
+  sum = silero_vad_hsum128_ps(acc);
+#endif
+
+  for (; i < count; ++i) {
+    sum += a[i] * b[i];
+  }
+
+  return sum;
+}
+
+static void silero_vad_pack_k3_weights(SileroVadConv1d *conv) {
+  const size_t block_width = 8;
+  const size_t padded_output_channels =
+    ((conv->output_channels + block_width - 1) / block_width) * block_width;
+  const size_t packed_count = padded_output_channels * conv->input_channels;
+  size_t oc;
+  size_t ic;
+
+  if (conv->kernel_size != 3 || conv->padding != 1) {
+    return;
+  }
+
+  conv->packed_weight_t0 = (float *)silero_vad_aligned_calloc(packed_count, sizeof(float));
+  conv->packed_weight_t1 = (float *)silero_vad_aligned_calloc(packed_count, sizeof(float));
+  conv->packed_weight_t2 = (float *)silero_vad_aligned_calloc(packed_count, sizeof(float));
+  if (conv->packed_weight_t0 == NULL || conv->packed_weight_t1 == NULL || conv->packed_weight_t2 == NULL) {
+    silero_vad_aligned_free(conv->packed_weight_t0);
+    silero_vad_aligned_free(conv->packed_weight_t1);
+    silero_vad_aligned_free(conv->packed_weight_t2);
+    conv->packed_weight_t0 = NULL;
+    conv->packed_weight_t1 = NULL;
+    conv->packed_weight_t2 = NULL;
+    return;
+  }
+
+  for (oc = 0; oc < padded_output_channels; ++oc) {
+    const size_t block = oc / block_width;
+    const size_t lane = oc % block_width;
+    for (ic = 0; ic < conv->input_channels; ++ic) {
+      const size_t dst = ((block * conv->input_channels) + ic) * block_width + lane;
+      if (oc < conv->output_channels) {
+        const size_t src = ((oc * conv->input_channels) + ic) * 3;
+        conv->packed_weight_t0[dst] = conv->weight[src];
+        conv->packed_weight_t1[dst] = conv->weight[src + 1];
+        conv->packed_weight_t2[dst] = conv->weight[src + 2];
+      } else {
+        conv->packed_weight_t0[dst] = 0.0f;
+        conv->packed_weight_t1[dst] = 0.0f;
+        conv->packed_weight_t2[dst] = 0.0f;
+      }
+    }
+  }
+}
+
+static void silero_vad_pack_lstm_weights(SileroVadLstmCell *cell) {
+  const size_t rows = cell->hidden_size * 4;
+  const size_t cols_ih = cell->input_size;
+  const size_t cols_hh = cell->hidden_size;
+  const size_t block_width = 8;
+  const size_t blocks = rows / block_width;
+  size_t block;
+  size_t col;
+  size_t lane;
+
+  if (rows == 0 || (rows % block_width) != 0) {
+    return;
+  }
+
+  cell->packed_weight_ih = (float *)silero_vad_aligned_calloc(rows * cols_ih, sizeof(float));
+  cell->packed_weight_hh = (float *)silero_vad_aligned_calloc(rows * cols_hh, sizeof(float));
+  if (cell->packed_weight_ih == NULL || cell->packed_weight_hh == NULL) {
+    silero_vad_aligned_free(cell->packed_weight_ih);
+    silero_vad_aligned_free(cell->packed_weight_hh);
+    cell->packed_weight_ih = NULL;
+    cell->packed_weight_hh = NULL;
+    return;
+  }
+
+  for (block = 0; block < blocks; ++block) {
+    const size_t row_base = block * block_width;
+    for (col = 0; col < cols_ih; ++col) {
+      const size_t dst_base = ((block * cols_ih) + col) * block_width;
+      for (lane = 0; lane < block_width; ++lane) {
+        cell->packed_weight_ih[dst_base + lane] =
+          cell->weight_ih[((row_base + lane) * cols_ih) + col];
+      }
+    }
+    for (col = 0; col < cols_hh; ++col) {
+      const size_t dst_base = ((block * cols_hh) + col) * block_width;
+      for (lane = 0; lane < block_width; ++lane) {
+        cell->packed_weight_hh[dst_base + lane] =
+          cell->weight_hh[((row_base + lane) * cols_hh) + col];
+      }
+    }
+  }
+}
+
+static void silero_vad_relu(float *data, size_t count) {
+  size_t i = 0;
+
+#if defined(__AVX2__)
+  const __m256 zero = _mm256_setzero_ps();
+  for (; i + 8 <= count; i += 8) {
+    __m256 v = _mm256_loadu_ps(data + i);
+    v = _mm256_max_ps(v, zero);
+    _mm256_storeu_ps(data + i, v);
+  }
+#elif defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  const float32x4_t zero = vdupq_n_f32(0.0f);
+  for (; i + 4 <= count; i += 4) {
+    float32x4_t v = vld1q_f32(data + i);
+    v = vmaxq_f32(v, zero);
+    vst1q_f32(data + i, v);
+  }
+#endif
+
+  for (; i < count; ++i) {
+    if (data[i] < 0.0f) {
+      data[i] = 0.0f;
+    }
+  }
+}
+
+static float silero_vad_sigmoid(float x) {
+  if (x >= 0.0f) {
+    float z = expf(-x);
+    return 1.0f / (1.0f + z);
+  }
+
+  {
+    float z = expf(x);
+    return z / (1.0f + z);
+  }
+}
+
+static unsigned short silero_vad_bit_reverse_8(unsigned short x) {
+  x = (unsigned short)(((x & 0x55u) << 1) | ((x >> 1) & 0x55u));
+  x = (unsigned short)(((x & 0x33u) << 2) | ((x >> 2) & 0x33u));
+  x = (unsigned short)(((x & 0x0Fu) << 4) | ((x >> 4) & 0x0Fu));
+  return x;
+}
+
+static void silero_vad_init_fft_tables(SileroVadModel *model) {
+  size_t i;
+
+  for (i = 0; i < SILERO_VAD_STFT_FFT_SIZE; ++i) {
+    const float angle = (float)((2.0 * 3.14159265358979323846 * (double)i) / (double)SILERO_VAD_STFT_FFT_SIZE);
+    model->fft_twiddle_cos[i] = cosf(angle);
+    model->fft_twiddle_sin[i] = -sinf(angle);
+    model->fft_bitrev[i] = silero_vad_bit_reverse_8((unsigned short)i);
+  }
+}
+
+static void silero_vad_fft256(float *real,
+                              float *imag,
+                              const float *twiddle_cos,
+                              const float *twiddle_sin,
+                              const unsigned short *bitrev) {
+  float tmp_real[SILERO_VAD_STFT_FFT_SIZE];
+  float tmp_imag[SILERO_VAD_STFT_FFT_SIZE];
+  size_t i;
+
+  for (i = 0; i < SILERO_VAD_STFT_FFT_SIZE; ++i) {
+    const size_t j = bitrev[i];
+    tmp_real[i] = real[j];
+    tmp_imag[i] = imag[j];
+  }
+
+  memcpy(real, tmp_real, sizeof(tmp_real));
+  memcpy(imag, tmp_imag, sizeof(tmp_imag));
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 2) {
+      const float r0 = real[start];
+      const float i0 = imag[start];
+      const float r1 = real[start + 1];
+      const float i1 = imag[start + 1];
+      real[start] = r0 + r1;
+      imag[start] = i0 + i1;
+      real[start + 1] = r0 - r1;
+      imag[start + 1] = i0 - i1;
+    }
+  }
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 4) {
+      const float r0 = real[start];
+      const float i0 = imag[start];
+      const float r1 = real[start + 1];
+      const float i1 = imag[start + 1];
+      const float r2 = real[start + 2];
+      const float i2 = imag[start + 2];
+      const float r3 = real[start + 3];
+      const float i3 = imag[start + 3];
+
+      real[start] = r0 + r2;
+      imag[start] = i0 + i2;
+      real[start + 2] = r0 - r2;
+      imag[start + 2] = i0 - i2;
+
+      real[start + 1] = r1 + i3;
+      imag[start + 1] = i1 - r3;
+      real[start + 3] = r1 - i3;
+      imag[start + 3] = i1 + r3;
+    }
+  }
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 8) {
+      size_t j;
+      for (j = 0; j < 4; ++j) {
+        const size_t even = start + j;
+        const size_t odd = even + 4;
+        const float wr = twiddle_cos[j * 32];
+        const float wi = twiddle_sin[j * 32];
+        const float orr = real[odd];
+        const float oii = imag[odd];
+        const float tr = (wr * orr) - (wi * oii);
+        const float ti = (wr * oii) + (wi * orr);
+        const float er = real[even];
+        const float ei = imag[even];
+        real[even] = er + tr;
+        imag[even] = ei + ti;
+        real[odd] = er - tr;
+        imag[odd] = ei - ti;
+      }
+    }
+  }
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 16) {
+      size_t j;
+      for (j = 0; j < 8; ++j) {
+        const size_t even = start + j;
+        const size_t odd = even + 8;
+        const float wr = twiddle_cos[j * 16];
+        const float wi = twiddle_sin[j * 16];
+        const float orr = real[odd];
+        const float oii = imag[odd];
+        const float tr = (wr * orr) - (wi * oii);
+        const float ti = (wr * oii) + (wi * orr);
+        const float er = real[even];
+        const float ei = imag[even];
+        real[even] = er + tr;
+        imag[even] = ei + ti;
+        real[odd] = er - tr;
+        imag[odd] = ei - ti;
+      }
+    }
+  }
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 32) {
+      size_t j;
+      for (j = 0; j < 16; ++j) {
+        const size_t even = start + j;
+        const size_t odd = even + 16;
+        const float wr = twiddle_cos[j * 8];
+        const float wi = twiddle_sin[j * 8];
+        const float orr = real[odd];
+        const float oii = imag[odd];
+        const float tr = (wr * orr) - (wi * oii);
+        const float ti = (wr * oii) + (wi * orr);
+        const float er = real[even];
+        const float ei = imag[even];
+        real[even] = er + tr;
+        imag[even] = ei + ti;
+        real[odd] = er - tr;
+        imag[odd] = ei - ti;
+      }
+    }
+  }
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 64) {
+      size_t j;
+      for (j = 0; j < 32; ++j) {
+        const size_t even = start + j;
+        const size_t odd = even + 32;
+        const float wr = twiddle_cos[j * 4];
+        const float wi = twiddle_sin[j * 4];
+        const float orr = real[odd];
+        const float oii = imag[odd];
+        const float tr = (wr * orr) - (wi * oii);
+        const float ti = (wr * oii) + (wi * orr);
+        const float er = real[even];
+        const float ei = imag[even];
+        real[even] = er + tr;
+        imag[even] = ei + ti;
+        real[odd] = er - tr;
+        imag[odd] = ei - ti;
+      }
+    }
+  }
+
+  {
+    size_t start;
+    for (start = 0; start < SILERO_VAD_STFT_FFT_SIZE; start += 128) {
+      size_t j;
+      for (j = 0; j < 64; ++j) {
+        const size_t even = start + j;
+        const size_t odd = even + 64;
+        const float wr = twiddle_cos[j * 2];
+        const float wi = twiddle_sin[j * 2];
+        const float orr = real[odd];
+        const float oii = imag[odd];
+        const float tr = (wr * orr) - (wi * oii);
+        const float ti = (wr * oii) + (wi * orr);
+        const float er = real[even];
+        const float ei = imag[even];
+        real[even] = er + tr;
+        imag[even] = ei + ti;
+        real[odd] = er - tr;
+        imag[odd] = ei - ti;
+      }
+    }
+  }
+
+  {
+    size_t j;
+    for (j = 0; j < 128; ++j) {
+      const size_t even = j;
+      const size_t odd = j + 128;
+      const float wr = twiddle_cos[j];
+      const float wi = twiddle_sin[j];
+      const float orr = real[odd];
+      const float oii = imag[odd];
+      const float tr = (wr * orr) - (wi * oii);
+      const float ti = (wr * oii) + (wi * orr);
+      const float er = real[even];
+      const float ei = imag[even];
+      real[even] = er + tr;
+      imag[even] = ei + ti;
+      real[odd] = er - tr;
+      imag[odd] = ei - ti;
+    }
+  }
+}
+
+static void silero_vad_conv1_from_stft_frame(const SileroVadConv1d *conv,
+                                             const float *prev_mag,
+                                             const float *curr_mag,
+                                             const float *next_mag,
+                                             float *output_frame) {
+  size_t ic;
+
+#if defined(__AVX2__)
+  if (conv->packed_weight_t0 != NULL && conv->packed_weight_t1 != NULL && conv->packed_weight_t2 != NULL) {
+    const size_t block_width = 8;
+    const size_t block_count = conv->output_channels / block_width;
+    const size_t simd_channels = block_count * block_width;
+    size_t block;
+    size_t oc;
+
+    for (block = 0; block < block_count; ++block) {
+      const size_t oc_base = block * block_width;
+      const float *w0 = conv->packed_weight_t0 + (block * conv->input_channels * block_width);
+      const float *w1 = conv->packed_weight_t1 + (block * conv->input_channels * block_width);
+      const float *w2 = conv->packed_weight_t2 + (block * conv->input_channels * block_width);
+      __m256 acc = conv->bias != NULL
+        ? _mm256_loadu_ps(conv->bias + oc_base)
+        : _mm256_setzero_ps();
+
+      for (ic = 0; ic < conv->input_channels; ++ic) {
+        const size_t weight_offset = ic * block_width;
+        if (prev_mag != NULL) {
+          acc = _mm256_add_ps(
+            acc,
+            _mm256_mul_ps(_mm256_set1_ps(prev_mag[ic]),
+                          _mm256_loadu_ps(w0 + weight_offset)));
+        }
+        acc = _mm256_add_ps(
+          acc,
+          _mm256_mul_ps(_mm256_set1_ps(curr_mag[ic]),
+                        _mm256_loadu_ps(w1 + weight_offset)));
+        if (next_mag != NULL) {
+          acc = _mm256_add_ps(
+            acc,
+            _mm256_mul_ps(_mm256_set1_ps(next_mag[ic]),
+                          _mm256_loadu_ps(w2 + weight_offset)));
+        }
+      }
+
+      _mm256_storeu_ps(output_frame + oc_base, acc);
+    }
+
+    for (oc = simd_channels; oc < conv->output_channels; ++oc) {
+      float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+      for (ic = 0; ic < conv->input_channels; ++ic) {
+        const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * 3);
+        if (prev_mag != NULL) {
+          acc += prev_mag[ic] * weight[0];
+        }
+        acc += curr_mag[ic] * weight[1];
+        if (next_mag != NULL) {
+          acc += next_mag[ic] * weight[2];
+        }
+      }
+      output_frame[oc] = acc;
+    }
+    return;
+  }
+#elif defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  if (conv->packed_weight_t0 != NULL && conv->packed_weight_t1 != NULL && conv->packed_weight_t2 != NULL) {
+    const size_t block_width = 8;
+    const size_t block_count = conv->output_channels / block_width;
+    const size_t simd_channels = block_count * block_width;
+    size_t block;
+    size_t oc;
+
+    for (block = 0; block < block_count; ++block) {
+      const size_t oc_base = block * block_width;
+      const float *w0 = conv->packed_weight_t0 + (block * conv->input_channels * block_width);
+      const float *w1 = conv->packed_weight_t1 + (block * conv->input_channels * block_width);
+      const float *w2 = conv->packed_weight_t2 + (block * conv->input_channels * block_width);
+      float32x4_t acc_lo = conv->bias != NULL
+        ? vld1q_f32(conv->bias + oc_base)
+        : vdupq_n_f32(0.0f);
+      float32x4_t acc_hi = conv->bias != NULL
+        ? vld1q_f32(conv->bias + oc_base + 4)
+        : vdupq_n_f32(0.0f);
+
+      for (ic = 0; ic < conv->input_channels; ++ic) {
+        const size_t weight_offset = ic * block_width;
+        if (prev_mag != NULL) {
+          const float32x4_t v = vdupq_n_f32(prev_mag[ic]);
+          acc_lo = vmlaq_f32(acc_lo, v, vld1q_f32(w0 + weight_offset));
+          acc_hi = vmlaq_f32(acc_hi, v, vld1q_f32(w0 + weight_offset + 4));
+        }
+        {
+          const float32x4_t v = vdupq_n_f32(curr_mag[ic]);
+          acc_lo = vmlaq_f32(acc_lo, v, vld1q_f32(w1 + weight_offset));
+          acc_hi = vmlaq_f32(acc_hi, v, vld1q_f32(w1 + weight_offset + 4));
+        }
+        if (next_mag != NULL) {
+          const float32x4_t v = vdupq_n_f32(next_mag[ic]);
+          acc_lo = vmlaq_f32(acc_lo, v, vld1q_f32(w2 + weight_offset));
+          acc_hi = vmlaq_f32(acc_hi, v, vld1q_f32(w2 + weight_offset + 4));
+        }
+      }
+
+      vst1q_f32(output_frame + oc_base, acc_lo);
+      vst1q_f32(output_frame + oc_base + 4, acc_hi);
+    }
+
+    for (oc = simd_channels; oc < conv->output_channels; ++oc) {
+      float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+      for (ic = 0; ic < conv->input_channels; ++ic) {
+        const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * 3);
+        if (prev_mag != NULL) {
+          acc += prev_mag[ic] * weight[0];
+        }
+        acc += curr_mag[ic] * weight[1];
+        if (next_mag != NULL) {
+          acc += next_mag[ic] * weight[2];
+        }
+      }
+      output_frame[oc] = acc;
+    }
+    return;
+  }
+#endif
+
+  {
+    size_t oc;
+    for (oc = 0; oc < conv->output_channels; ++oc) {
+      float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+      for (ic = 0; ic < conv->input_channels; ++ic) {
+        const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * 3);
+        if (prev_mag != NULL) {
+          acc += prev_mag[ic] * weight[0];
+        }
+        acc += curr_mag[ic] * weight[1];
+        if (next_mag != NULL) {
+          acc += next_mag[ic] * weight[2];
+        }
+      }
+      output_frame[oc] = acc;
+    }
+  }
+}
+
+static void silero_vad_stft_conv1_fused_forward(SileroVadModel *model,
+                                                const float *input) {
+  float mag_ring[3][SILERO_VAD_STFT_BINS];
+  size_t frame;
+  size_t i;
+
+  if (model->stft_frames == 0) {
+    return;
+  }
+
+  memset(mag_ring, 0, sizeof(mag_ring));
+
+  for (frame = 0; frame < model->stft_frames; ++frame) {
+    const float *frame_input = input + (frame * SILERO_VAD_STFT_HOP_SIZE);
+    const size_t slot = frame % 3;
+    float *curr_mag = mag_ring[slot];
+
+    for (i = 0; i < SILERO_VAD_STFT_FFT_SIZE; ++i) {
+      const float hann = 0.5f - (0.5f * model->fft_twiddle_cos[i]);
+      model->fft_real[i] = frame_input[i] * hann;
+      model->fft_imag[i] = 0.0f;
+    }
+
+    silero_vad_fft256(model->fft_real,
+                      model->fft_imag,
+                      model->fft_twiddle_cos,
+                      model->fft_twiddle_sin,
+                      model->fft_bitrev);
+
+#if defined(__AVX2__)
+    {
+      size_t bin = 0;
+      for (; bin + 8 <= SILERO_VAD_STFT_BINS; bin += 8) {
+        const __m256 vr = _mm256_loadu_ps(model->fft_real + bin);
+        const __m256 vi = _mm256_loadu_ps(model->fft_imag + bin);
+        const __m256 mag2 = _mm256_add_ps(_mm256_mul_ps(vr, vr), _mm256_mul_ps(vi, vi));
+        _mm256_storeu_ps(curr_mag + bin, _mm256_sqrt_ps(mag2));
+      }
+      for (; bin < SILERO_VAD_STFT_BINS; ++bin) {
+        curr_mag[bin] =
+          sqrtf((model->fft_real[bin] * model->fft_real[bin]) +
+                (model->fft_imag[bin] * model->fft_imag[bin]));
+      }
+    }
+#elif defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    {
+      size_t bin = 0;
+      for (; bin + 4 <= SILERO_VAD_STFT_BINS; bin += 4) {
+        const float32x4_t vr = vld1q_f32(model->fft_real + bin);
+        const float32x4_t vi = vld1q_f32(model->fft_imag + bin);
+        const float32x4_t mag2 = vmlaq_f32(vmulq_f32(vr, vr), vi, vi);
+        vst1q_f32(curr_mag + bin, vsqrtq_f32(mag2));
+      }
+      for (; bin < SILERO_VAD_STFT_BINS; ++bin) {
+        curr_mag[bin] =
+          sqrtf((model->fft_real[bin] * model->fft_real[bin]) +
+                (model->fft_imag[bin] * model->fft_imag[bin]));
+      }
+    }
+#else
+    for (i = 0; i < SILERO_VAD_STFT_BINS; ++i) {
+      curr_mag[i] =
+        sqrtf((model->fft_real[i] * model->fft_real[i]) +
+              (model->fft_imag[i] * model->fft_imag[i]));
+    }
+#endif
+
+    if (frame > 0) {
+      const size_t out_frame = frame - 1;
+      const float *prev_mag = (out_frame == 0) ? NULL : mag_ring[(frame + 1) % 3];
+      const float *center_mag = mag_ring[(frame + 2) % 3];
+      float conv1_frame[128];
+      size_t oc;
+
+      silero_vad_conv1_from_stft_frame(&model->conv1, prev_mag, center_mag, curr_mag, conv1_frame);
+      for (oc = 0; oc < 128; ++oc) {
+        model->conv1_out[(oc * model->stft_frames) + out_frame] = conv1_frame[oc] > 0.0f ? conv1_frame[oc] : 0.0f;
+      }
+    }
+  }
+
+  {
+    const size_t out_frame = model->stft_frames - 1;
+    const float *prev_mag = (out_frame == 0) ? NULL : mag_ring[(model->stft_frames + 1) % 3];
+    const float *center_mag = mag_ring[(model->stft_frames - 1) % 3];
+    float conv1_frame[128];
+    size_t oc;
+
+    silero_vad_conv1_from_stft_frame(&model->conv1, prev_mag, center_mag, NULL, conv1_frame);
+    for (oc = 0; oc < 128; ++oc) {
+      model->conv1_out[(oc * model->stft_frames) + out_frame] = conv1_frame[oc] > 0.0f ? conv1_frame[oc] : 0.0f;
+    }
+  }
+}
+
+static void silero_vad_zero_model(SileroVadModel *model) {
+  memset(model, 0, sizeof(*model));
+}
+
+size_t silero_vad_conv1d_output_frames(size_t input_frames,
+                                       size_t kernel_size,
+                                       size_t stride,
+                                       size_t padding) {
+  size_t padded_frames;
+
+  if (stride == 0) {
+    return 0;
+  }
+
+  padded_frames = input_frames + (2 * padding);
+  if (padded_frames < kernel_size) {
+    return 0;
+  }
+
+  return 1 + ((padded_frames - kernel_size) / stride);
+}
+
+SileroVadStatus silero_vad_conv1d_init(SileroVadConv1d *conv,
+                                       size_t input_channels,
+                                       size_t output_channels,
+                                       size_t kernel_size,
+                                       size_t stride,
+                                       size_t padding,
+                                       size_t max_input_frames,
+                                       const float *weight,
+                                       const float *bias) {
+  if (conv == NULL || weight == NULL || input_channels == 0 || output_channels == 0 ||
+      kernel_size == 0 || stride == 0 || max_input_frames == 0) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  memset(conv, 0, sizeof(*conv));
+  conv->input_channels = input_channels;
+  conv->output_channels = output_channels;
+  conv->kernel_size = kernel_size;
+  conv->stride = stride;
+  conv->padding = padding;
+  conv->weight = weight;
+  conv->bias = bias;
+  conv->max_input_frames = max_input_frames;
+
+  if (!(kernel_size == 3 && padding == 1)) {
+    const size_t padded_frames = max_input_frames + (2 * padding);
+    const size_t padded_values = input_channels * padded_frames;
+    conv->padded_input = (float *)silero_vad_aligned_calloc(padded_values, sizeof(float));
+    if (conv->padded_input == NULL) {
+      return SILERO_VAD_STATUS_ALLOCATION_FAILED;
+    }
+    conv->padded_capacity = padded_values;
+  }
+
+  silero_vad_pack_k3_weights(conv);
+  return SILERO_VAD_STATUS_OK;
+}
+
+void silero_vad_conv1d_reset(SileroVadConv1d *conv) {
+  if (conv == NULL || conv->padded_input == NULL) {
+    return;
+  }
+
+  memset(conv->padded_input, 0, conv->padded_capacity * sizeof(float));
+}
+
+void silero_vad_conv1d_free(SileroVadConv1d *conv) {
+  if (conv == NULL) {
+    return;
+  }
+
+  silero_vad_aligned_free(conv->padded_input);
+  silero_vad_aligned_free(conv->packed_weight_t0);
+  silero_vad_aligned_free(conv->packed_weight_t1);
+  silero_vad_aligned_free(conv->packed_weight_t2);
+  memset(conv, 0, sizeof(*conv));
+}
+
+SileroVadStatus silero_vad_conv1d_forward(SileroVadConv1d *conv,
+                                          const float *input,
+                                          size_t input_frames,
+                                          float *output) {
+  size_t padded_frames;
+  size_t out_frames;
+  size_t ic;
+  size_t oc;
+  size_t of;
+  size_t k;
+
+  if (conv == NULL || input == NULL || output == NULL) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (input_frames == 0 || input_frames > conv->max_input_frames) {
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+  padded_frames = input_frames + (2 * conv->padding);
+  out_frames = silero_vad_conv1d_output_frames(input_frames,
+                                               conv->kernel_size,
+                                               conv->stride,
+                                               conv->padding);
+  if (out_frames == 0) {
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+  for (ic = 0; ic < conv->input_channels; ++ic) {
+    float *dst = conv->padded_input + (ic * padded_frames);
+    const float *src = input + (ic * input_frames);
+    memset(dst, 0, padded_frames * sizeof(float));
+    memcpy(dst + conv->padding, src, input_frames * sizeof(float));
+  }
+
+  for (oc = 0; oc < conv->output_channels; ++oc) {
+    for (of = 0; of < out_frames; ++of) {
+      float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+      const size_t input_start = of * conv->stride;
+
+      for (ic = 0; ic < conv->input_channels; ++ic) {
+        const float *padded = conv->padded_input + (ic * padded_frames) + input_start;
+        const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * conv->kernel_size);
+
+        for (k = 0; k < conv->kernel_size; ++k) {
+          acc += padded[k] * weight[k];
+        }
+      }
+
+      output[(oc * out_frames) + of] = acc;
+    }
+  }
+
+  return SILERO_VAD_STATUS_OK;
+}
+
+static SileroVadStatus silero_vad_conv1d_k3_p1_forward(const SileroVadConv1d *conv,
+                                                       const float *input,
+                                                       size_t input_frames,
+                                                       float *output) {
+  size_t out_frames;
+  size_t of;
+  size_t ic;
+
+  if (conv == NULL || input == NULL || output == NULL) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (conv->kernel_size != 3 || conv->padding != 1 || conv->stride == 0) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (input_frames == 0 || input_frames > conv->max_input_frames) {
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+  out_frames = silero_vad_conv1d_output_frames(input_frames,
+                                               conv->kernel_size,
+                                               conv->stride,
+                                               conv->padding);
+  if (out_frames == 0) {
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+#if defined(__AVX2__)
+  if (conv->packed_weight_t0 != NULL && conv->packed_weight_t1 != NULL && conv->packed_weight_t2 != NULL) {
+    const size_t block_width = 8;
+    const size_t block_count = conv->output_channels / block_width;
+    const size_t simd_channels = block_count * block_width;
+    size_t block;
+    size_t oc;
+
+    for (of = 0; of < out_frames; ++of) {
+      const size_t center = of * conv->stride;
+      for (block = 0; block < block_count; ++block) {
+        const size_t oc_base = block * block_width;
+        const float *w0 = conv->packed_weight_t0 + (block * conv->input_channels * block_width);
+        const float *w1 = conv->packed_weight_t1 + (block * conv->input_channels * block_width);
+        const float *w2 = conv->packed_weight_t2 + (block * conv->input_channels * block_width);
+        __m256 acc = conv->bias != NULL
+          ? _mm256_loadu_ps(conv->bias + oc_base)
+          : _mm256_setzero_ps();
+
+        for (ic = 0; ic < conv->input_channels; ++ic) {
+          const float *src = input + (ic * input_frames);
+          const size_t weight_offset = ic * block_width;
+
+          if (center > 0) {
+            acc = _mm256_add_ps(
+              acc,
+              _mm256_mul_ps(_mm256_set1_ps(src[center - 1]),
+                            _mm256_loadu_ps(w0 + weight_offset)));
+          }
+          acc = _mm256_add_ps(
+            acc,
+            _mm256_mul_ps(_mm256_set1_ps(src[center]),
+                          _mm256_loadu_ps(w1 + weight_offset)));
+          if ((center + 1) < input_frames) {
+            acc = _mm256_add_ps(
+              acc,
+              _mm256_mul_ps(_mm256_set1_ps(src[center + 1]),
+                            _mm256_loadu_ps(w2 + weight_offset)));
+          }
+        }
+
+        {
+          float tmp[8];
+          size_t lane;
+          _mm256_storeu_ps(tmp, acc);
+          for (lane = 0; lane < block_width; ++lane) {
+            output[((oc_base + lane) * out_frames) + of] = tmp[lane];
+          }
+        }
+      }
+
+      for (oc = simd_channels; oc < conv->output_channels; ++oc) {
+        float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+        for (ic = 0; ic < conv->input_channels; ++ic) {
+          const float *src = input + (ic * input_frames);
+          const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * 3);
+
+          if (center > 0) {
+            acc += src[center - 1] * weight[0];
+          }
+          acc += src[center] * weight[1];
+          if ((center + 1) < input_frames) {
+            acc += src[center + 1] * weight[2];
+          }
+        }
+        output[(oc * out_frames) + of] = acc;
+      }
+    }
+
+    return SILERO_VAD_STATUS_OK;
+  }
+#elif defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  if (conv->packed_weight_t0 != NULL && conv->packed_weight_t1 != NULL && conv->packed_weight_t2 != NULL) {
+    const size_t block_width = 8;
+    const size_t block_count = conv->output_channels / block_width;
+    const size_t simd_channels = block_count * block_width;
+    size_t block;
+    size_t oc;
+
+    for (of = 0; of < out_frames; ++of) {
+      const size_t center = of * conv->stride;
+      for (block = 0; block < block_count; ++block) {
+        const size_t oc_base = block * block_width;
+        const float *w0 = conv->packed_weight_t0 + (block * conv->input_channels * block_width);
+        const float *w1 = conv->packed_weight_t1 + (block * conv->input_channels * block_width);
+        const float *w2 = conv->packed_weight_t2 + (block * conv->input_channels * block_width);
+        float32x4_t acc_lo = conv->bias != NULL
+          ? vld1q_f32(conv->bias + oc_base)
+          : vdupq_n_f32(0.0f);
+        float32x4_t acc_hi = conv->bias != NULL
+          ? vld1q_f32(conv->bias + oc_base + 4)
+          : vdupq_n_f32(0.0f);
+
+        for (ic = 0; ic < conv->input_channels; ++ic) {
+          const float *src = input + (ic * input_frames);
+          const size_t weight_offset = ic * block_width;
+
+          if (center > 0) {
+            const float32x4_t v = vdupq_n_f32(src[center - 1]);
+            acc_lo = vmlaq_f32(acc_lo, v, vld1q_f32(w0 + weight_offset));
+            acc_hi = vmlaq_f32(acc_hi, v, vld1q_f32(w0 + weight_offset + 4));
+          }
+          {
+            const float32x4_t v = vdupq_n_f32(src[center]);
+            acc_lo = vmlaq_f32(acc_lo, v, vld1q_f32(w1 + weight_offset));
+            acc_hi = vmlaq_f32(acc_hi, v, vld1q_f32(w1 + weight_offset + 4));
+          }
+          if ((center + 1) < input_frames) {
+            const float32x4_t v = vdupq_n_f32(src[center + 1]);
+            acc_lo = vmlaq_f32(acc_lo, v, vld1q_f32(w2 + weight_offset));
+            acc_hi = vmlaq_f32(acc_hi, v, vld1q_f32(w2 + weight_offset + 4));
+          }
+        }
+
+        {
+          float tmp[8];
+          vst1q_f32(tmp, acc_lo);
+          vst1q_f32(tmp + 4, acc_hi);
+          {
+            size_t lane;
+            for (lane = 0; lane < block_width; ++lane) {
+              output[((oc_base + lane) * out_frames) + of] = tmp[lane];
+            }
+          }
+        }
+      }
+
+      for (oc = simd_channels; oc < conv->output_channels; ++oc) {
+        float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+        for (ic = 0; ic < conv->input_channels; ++ic) {
+          const float *src = input + (ic * input_frames);
+          const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * 3);
+
+          if (center > 0) {
+            acc += src[center - 1] * weight[0];
+          }
+          acc += src[center] * weight[1];
+          if ((center + 1) < input_frames) {
+            acc += src[center + 1] * weight[2];
+          }
+        }
+        output[(oc * out_frames) + of] = acc;
+      }
+    }
+
+    return SILERO_VAD_STATUS_OK;
+  }
+#endif
+
+  {
+    size_t oc;
+    for (oc = 0; oc < conv->output_channels; ++oc) {
+      for (of = 0; of < out_frames; ++of) {
+        const size_t center = of * conv->stride;
+        float acc = conv->bias != NULL ? conv->bias[oc] : 0.0f;
+        for (ic = 0; ic < conv->input_channels; ++ic) {
+          const float *src = input + (ic * input_frames);
+          const float *weight = conv->weight + (((oc * conv->input_channels) + ic) * 3);
+
+          if (center > 0) {
+            acc += src[center - 1] * weight[0];
+          }
+          acc += src[center] * weight[1];
+          if ((center + 1) < input_frames) {
+            acc += src[center + 1] * weight[2];
+          }
+        }
+
+        output[(oc * out_frames) + of] = acc;
+      }
+    }
+  }
+
+  return SILERO_VAD_STATUS_OK;
+}
+
+SileroVadStatus silero_vad_lstm_cell_init(SileroVadLstmCell *cell,
+                                          size_t input_size,
+                                          size_t hidden_size,
+                                          const float *weight_ih,
+                                          const float *weight_hh,
+                                          const float *bias_ih,
+                                          const float *bias_hh) {
+  if (cell == NULL || weight_ih == NULL || weight_hh == NULL ||
+      bias_ih == NULL || bias_hh == NULL || input_size == 0 || hidden_size == 0) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  memset(cell, 0, sizeof(*cell));
+  cell->input_size = input_size;
+  cell->hidden_size = hidden_size;
+  cell->weight_ih = weight_ih;
+  cell->weight_hh = weight_hh;
+  cell->bias_ih = bias_ih;
+  cell->bias_hh = bias_hh;
+
+  cell->hidden_state = (float *)silero_vad_aligned_calloc(hidden_size, sizeof(float));
+  cell->cell_state = (float *)silero_vad_aligned_calloc(hidden_size, sizeof(float));
+  cell->gates = (float *)silero_vad_aligned_calloc(hidden_size * 4, sizeof(float));
+  silero_vad_pack_lstm_weights(cell);
+
+  if (cell->hidden_state == NULL || cell->cell_state == NULL || cell->gates == NULL) {
+    silero_vad_lstm_cell_free(cell);
+    return SILERO_VAD_STATUS_ALLOCATION_FAILED;
+  }
+
+  return SILERO_VAD_STATUS_OK;
+}
+
+void silero_vad_lstm_cell_reset(SileroVadLstmCell *cell) {
+  if (cell == NULL) {
+    return;
+  }
+
+  if (cell->hidden_state != NULL) {
+    memset(cell->hidden_state, 0, cell->hidden_size * sizeof(float));
+  }
+
+  if (cell->cell_state != NULL) {
+    memset(cell->cell_state, 0, cell->hidden_size * sizeof(float));
+  }
+
+  if (cell->gates != NULL) {
+    memset(cell->gates, 0, (cell->hidden_size * 4) * sizeof(float));
+  }
+}
+
+void silero_vad_lstm_cell_free(SileroVadLstmCell *cell) {
+  if (cell == NULL) {
+    return;
+  }
+
+  silero_vad_aligned_free(cell->hidden_state);
+  silero_vad_aligned_free(cell->cell_state);
+  silero_vad_aligned_free(cell->gates);
+  silero_vad_aligned_free(cell->packed_weight_ih);
+  silero_vad_aligned_free(cell->packed_weight_hh);
+  memset(cell, 0, sizeof(*cell));
+}
+
+SileroVadStatus silero_vad_lstm_cell_forward(SileroVadLstmCell *cell,
+                                             const float *input,
+                                             float *hidden_out) {
+  size_t h;
+  const size_t hidden_size = cell != NULL ? cell->hidden_size : 0;
+
+  if (cell == NULL || input == NULL || hidden_out == NULL) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+#if defined(__AVX2__)
+  if (cell->packed_weight_ih != NULL && cell->packed_weight_hh != NULL && ((hidden_size * 4) % 8) == 0) {
+    const size_t rows = hidden_size * 4;
+    const size_t blocks = rows / 8;
+    size_t block;
+
+    for (block = 0; block < blocks; ++block) {
+      const size_t row_base = block * 8;
+      const float *packed_ih = cell->packed_weight_ih + (block * cell->input_size * 8);
+      const float *packed_hh = cell->packed_weight_hh + (block * hidden_size * 8);
+      __m256 gate = _mm256_add_ps(_mm256_loadu_ps(cell->bias_ih + row_base),
+                                  _mm256_loadu_ps(cell->bias_hh + row_base));
+      size_t i;
+
+      for (i = 0; i < cell->input_size; ++i) {
+        const __m256 weights = _mm256_loadu_ps(packed_ih + (i * 8));
+        gate = _mm256_add_ps(gate, _mm256_mul_ps(_mm256_set1_ps(input[i]), weights));
+      }
+      for (i = 0; i < hidden_size; ++i) {
+        const __m256 weights = _mm256_loadu_ps(packed_hh + (i * 8));
+        gate = _mm256_add_ps(gate, _mm256_mul_ps(_mm256_set1_ps(cell->hidden_state[i]), weights));
+      }
+
+      _mm256_storeu_ps(cell->gates + row_base, gate);
+    }
+  } else
+#elif defined(SILERO_VAD_ENABLE_NEON) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  if (cell->packed_weight_ih != NULL && cell->packed_weight_hh != NULL && ((hidden_size * 4) % 8) == 0) {
+    const size_t rows = hidden_size * 4;
+    const size_t blocks = rows / 8;
+    size_t block;
+
+    for (block = 0; block < blocks; ++block) {
+      const size_t row_base = block * 8;
+      const float *packed_ih = cell->packed_weight_ih + (block * cell->input_size * 8);
+      const float *packed_hh = cell->packed_weight_hh + (block * hidden_size * 8);
+      float32x4_t gate_lo = vaddq_f32(vld1q_f32(cell->bias_ih + row_base),
+                                      vld1q_f32(cell->bias_hh + row_base));
+      float32x4_t gate_hi = vaddq_f32(vld1q_f32(cell->bias_ih + row_base + 4),
+                                      vld1q_f32(cell->bias_hh + row_base + 4));
+      size_t i;
+
+      for (i = 0; i < cell->input_size; ++i) {
+        const float32x4_t v = vdupq_n_f32(input[i]);
+        gate_lo = vmlaq_f32(gate_lo, v, vld1q_f32(packed_ih + (i * 8)));
+        gate_hi = vmlaq_f32(gate_hi, v, vld1q_f32(packed_ih + (i * 8) + 4));
+      }
+      for (i = 0; i < hidden_size; ++i) {
+        const float32x4_t v = vdupq_n_f32(cell->hidden_state[i]);
+        gate_lo = vmlaq_f32(gate_lo, v, vld1q_f32(packed_hh + (i * 8)));
+        gate_hi = vmlaq_f32(gate_hi, v, vld1q_f32(packed_hh + (i * 8) + 4));
+      }
+
+      vst1q_f32(cell->gates + row_base, gate_lo);
+      vst1q_f32(cell->gates + row_base + 4, gate_hi);
+    }
+  } else
+#endif
+  {
+    for (h = 0; h < hidden_size * 4; ++h) {
+      float gate = cell->bias_ih[h] + cell->bias_hh[h];
+      const float *w_ih = cell->weight_ih + (h * cell->input_size);
+      const float *w_hh = cell->weight_hh + (h * hidden_size);
+
+      gate += silero_vad_dot_f32(w_ih, input, cell->input_size);
+      gate += silero_vad_dot_f32(w_hh, cell->hidden_state, hidden_size);
+      cell->gates[h] = gate;
+    }
+  }
+
+  for (h = 0; h < hidden_size; ++h) {
+    const float input_gate = silero_vad_sigmoid(cell->gates[h]);
+    const float forget_gate = silero_vad_sigmoid(cell->gates[hidden_size + h]);
+    const float cell_gate = tanhf(cell->gates[(2 * hidden_size) + h]);
+    const float output_gate = silero_vad_sigmoid(cell->gates[(3 * hidden_size) + h]);
+    const float new_cell = (forget_gate * cell->cell_state[h]) + (input_gate * cell_gate);
+    const float new_hidden = output_gate * tanhf(new_cell);
+
+    cell->cell_state[h] = new_cell;
+    cell->hidden_state[h] = new_hidden;
+    hidden_out[h] = new_hidden;
+  }
+
+  return SILERO_VAD_STATUS_OK;
+}
+
+static void silero_vad_model_free_buffers(SileroVadModel *model) {
+  silero_vad_aligned_free(model->padded_audio);
+  silero_vad_aligned_free(model->fft_real);
+  silero_vad_aligned_free(model->fft_imag);
+  silero_vad_aligned_free(model->stft_mag);
+  silero_vad_aligned_free(model->conv1_out);
+  silero_vad_aligned_free(model->conv2_out);
+  silero_vad_aligned_free(model->conv3_out);
+  silero_vad_aligned_free(model->conv4_out);
+  silero_vad_aligned_free(model->lstm_out);
+  silero_vad_aligned_free(model->final_out);
+  silero_vad_aligned_free(model->fft_twiddle_cos);
+  silero_vad_aligned_free(model->fft_twiddle_sin);
+  silero_vad_aligned_free(model->fft_bitrev);
+
+  model->padded_audio = NULL;
+  model->fft_real = NULL;
+  model->fft_imag = NULL;
+  model->stft_mag = NULL;
+  model->conv1_out = NULL;
+  model->conv2_out = NULL;
+  model->conv3_out = NULL;
+  model->conv4_out = NULL;
+  model->lstm_out = NULL;
+  model->final_out = NULL;
+  model->fft_twiddle_cos = NULL;
+  model->fft_twiddle_sin = NULL;
+  model->fft_bitrev = NULL;
+}
+
+static SileroVadStatus silero_vad_model_alloc_buffers(SileroVadModel *model) {
+  const size_t padded_audio_samples = model->input_samples + SILERO_VAD_STFT_RIGHT_PAD;
+
+  model->padded_audio = (float *)silero_vad_aligned_calloc(padded_audio_samples, sizeof(float));
+  model->fft_real = (float *)silero_vad_aligned_calloc(SILERO_VAD_STFT_FFT_SIZE, sizeof(float));
+  model->fft_imag = (float *)silero_vad_aligned_calloc(SILERO_VAD_STFT_FFT_SIZE, sizeof(float));
+  model->stft_mag = (float *)silero_vad_aligned_calloc(SILERO_VAD_STFT_BINS * model->stft_frames, sizeof(float));
+  model->conv1_out = (float *)silero_vad_aligned_calloc(128 * model->stft_frames, sizeof(float));
+  model->conv2_out = (float *)silero_vad_aligned_calloc(64 * model->conv2_frames, sizeof(float));
+  model->conv3_out = (float *)silero_vad_aligned_calloc(64 * model->conv3_frames, sizeof(float));
+  model->conv4_out = (float *)silero_vad_aligned_calloc(128 * model->conv4_frames, sizeof(float));
+  model->lstm_out = (float *)silero_vad_aligned_calloc(SILERO_VAD_HIDDEN_SIZE, sizeof(float));
+  model->final_out = (float *)silero_vad_aligned_calloc(model->conv4_frames, sizeof(float));
+  model->fft_twiddle_cos = (float *)silero_vad_aligned_calloc(SILERO_VAD_STFT_FFT_SIZE, sizeof(float));
+  model->fft_twiddle_sin = (float *)silero_vad_aligned_calloc(SILERO_VAD_STFT_FFT_SIZE, sizeof(float));
+  model->fft_bitrev = (unsigned short *)silero_vad_aligned_calloc(SILERO_VAD_STFT_FFT_SIZE, sizeof(unsigned short));
+
+  if (model->padded_audio == NULL || model->fft_real == NULL || model->fft_imag == NULL || model->stft_mag == NULL ||
+      model->conv1_out == NULL || model->conv2_out == NULL || model->conv3_out == NULL ||
+      model->conv4_out == NULL || model->lstm_out == NULL || model->final_out == NULL ||
+      model->fft_twiddle_cos == NULL || model->fft_twiddle_sin == NULL || model->fft_bitrev == NULL) {
+    silero_vad_model_free_buffers(model);
+    return SILERO_VAD_STATUS_ALLOCATION_FAILED;
+  }
+
+  silero_vad_init_fft_tables(model);
+  return SILERO_VAD_STATUS_OK;
+}
+
+SileroVadStatus silero_vad_model_init(SileroVadModel *model,
+                                      const SileroVadWeights *weights,
+                                      size_t input_samples) {
+  SileroVadStatus status;
+
+  if (model == NULL || input_samples == 0 || silero_vad_has_null_weights(weights)) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  silero_vad_zero_model(model);
+  model->input_samples = input_samples;
+  model->stft_frames = silero_vad_conv1d_output_frames(input_samples + SILERO_VAD_STFT_RIGHT_PAD,
+                                                       SILERO_VAD_STFT_FFT_SIZE,
+                                                       SILERO_VAD_STFT_HOP_SIZE,
+                                                       0);
+  model->conv2_frames = silero_vad_conv1d_output_frames(model->stft_frames, 3, 2, 1);
+  model->conv3_frames = silero_vad_conv1d_output_frames(model->conv2_frames, 3, 2, 1);
+  model->conv4_frames = silero_vad_conv1d_output_frames(model->conv3_frames, 3, 1, 1);
+
+  if (model->stft_frames == 0 || model->conv2_frames == 0 ||
+      model->conv3_frames == 0 || model->conv4_frames != 1) {
+    silero_vad_model_free(model);
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+  status = silero_vad_conv1d_init(&model->conv1,
+                                  129, 128, 3, 1, 1,
+                                  model->stft_frames,
+                                  weights->conv1_weight, weights->conv1_bias);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  status = silero_vad_conv1d_init(&model->conv2,
+                                  128, 64, 3, 2, 1,
+                                  model->stft_frames,
+                                  weights->conv2_weight, weights->conv2_bias);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  status = silero_vad_conv1d_init(&model->conv3,
+                                  64, 64, 3, 2, 1,
+                                  model->conv2_frames,
+                                  weights->conv3_weight, weights->conv3_bias);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  status = silero_vad_conv1d_init(&model->conv4,
+                                  64, 128, 3, 1, 1,
+                                  model->conv3_frames,
+                                  weights->conv4_weight, weights->conv4_bias);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  status = silero_vad_conv1d_init(&model->final_conv,
+                                  128, 1, 1, 1, 0,
+                                  model->conv4_frames,
+                                  weights->final_conv_weight, weights->final_conv_bias);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  status = silero_vad_lstm_cell_init(&model->lstm,
+                                     128, 128,
+                                     weights->lstm_weight_ih,
+                                     weights->lstm_weight_hh,
+                                     weights->lstm_bias_ih,
+                                     weights->lstm_bias_hh);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  status = silero_vad_model_alloc_buffers(model);
+  if (status != SILERO_VAD_STATUS_OK) {
+    silero_vad_model_free(model);
+    return status;
+  }
+
+  return SILERO_VAD_STATUS_OK;
+}
+
+SileroVadModel *silero_vad_model_create(const SileroVadWeights *weights,
+                                        size_t input_samples) {
+  SileroVadModel *model;
+  SileroVadStatus status;
+
+  model = (SileroVadModel *)calloc(1, sizeof(*model));
+  if (model == NULL) {
+    return NULL;
+  }
+
+  status = silero_vad_model_init(model, weights, input_samples);
+  if (status != SILERO_VAD_STATUS_OK) {
+    free(model);
+    return NULL;
+  }
+
+  return model;
+}
+
+void silero_vad_model_reset(SileroVadModel *model) {
+  if (model == NULL) {
+    return;
+  }
+
+  silero_vad_lstm_cell_reset(&model->lstm);
+}
+
+void silero_vad_model_free(SileroVadModel *model) {
+  if (model == NULL) {
+    return;
+  }
+
+  silero_vad_conv1d_free(&model->conv1);
+  silero_vad_conv1d_free(&model->conv2);
+  silero_vad_conv1d_free(&model->conv3);
+  silero_vad_conv1d_free(&model->conv4);
+  silero_vad_conv1d_free(&model->final_conv);
+  silero_vad_lstm_cell_free(&model->lstm);
+  silero_vad_model_free_buffers(model);
+
+  model->input_samples = 0;
+  model->stft_frames = 0;
+  model->conv2_frames = 0;
+  model->conv3_frames = 0;
+  model->conv4_frames = 0;
+}
+
+void silero_vad_model_destroy(SileroVadModel *model) {
+  if (model == NULL) {
+    return;
+  }
+
+  silero_vad_model_free(model);
+  free(model);
+}
+
+size_t silero_vad_model_audio_prob_count(size_t audio_samples) {
+  const size_t window_size = 512;
+
+  if (audio_samples == 0) {
+    return 0;
+  }
+
+  return (audio_samples + window_size - 1) / window_size;
+}
+
+SileroVadStatus silero_vad_model_forward(SileroVadModel *model,
+                                         const float *input,
+                                         float *speech_probability) {
+  SileroVadStatus status;
+
+  if (model == NULL || input == NULL || speech_probability == NULL) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  silero_vad_reflect_pad_right(input,
+                               model->input_samples,
+                               SILERO_VAD_STFT_RIGHT_PAD,
+                               model->padded_audio);
+
+  silero_vad_stft_conv1_fused_forward(model, model->padded_audio);
+
+  status = silero_vad_conv1d_k3_p1_forward(&model->conv2,
+                                           model->conv1_out,
+                                           model->stft_frames,
+                                           model->conv2_out);
+  if (status != SILERO_VAD_STATUS_OK) {
+    return status;
+  }
+  silero_vad_relu(model->conv2_out, 64 * model->conv2_frames);
+
+  status = silero_vad_conv1d_k3_p1_forward(&model->conv3,
+                                           model->conv2_out,
+                                           model->conv2_frames,
+                                           model->conv3_out);
+  if (status != SILERO_VAD_STATUS_OK) {
+    return status;
+  }
+  silero_vad_relu(model->conv3_out, 64 * model->conv3_frames);
+
+  status = silero_vad_conv1d_k3_p1_forward(&model->conv4,
+                                           model->conv3_out,
+                                           model->conv3_frames,
+                                           model->conv4_out);
+  if (status != SILERO_VAD_STATUS_OK) {
+    return status;
+  }
+  silero_vad_relu(model->conv4_out, 128 * model->conv4_frames);
+
+  status = silero_vad_lstm_cell_forward(&model->lstm, model->conv4_out, model->lstm_out);
+  if (status != SILERO_VAD_STATUS_OK) {
+    return status;
+  }
+  silero_vad_relu(model->lstm_out, SILERO_VAD_HIDDEN_SIZE);
+
+  model->final_out[0] = (model->final_conv.bias != NULL ? model->final_conv.bias[0] : 0.0f) +
+                        silero_vad_dot_f32(model->final_conv.weight,
+                                           model->lstm_out,
+                                           SILERO_VAD_HIDDEN_SIZE);
+
+  *speech_probability = silero_vad_sigmoid(model->final_out[0]);
+  return SILERO_VAD_STATUS_OK;
+}
+
+SileroVadStatus silero_vad_model_forward_audio(SileroVadModel *model,
+                                               const float *audio,
+                                               size_t audio_samples,
+                                               float *speech_probabilities,
+                                               size_t speech_probabilities_capacity,
+                                               size_t *speech_probabilities_written) {
+  const size_t window_size = 512;
+  const size_t context_size = 64;
+  const size_t chunk_size = context_size + window_size;
+  const size_t required_probs = silero_vad_model_audio_prob_count(audio_samples);
+  float context[64] = {0};
+  float chunk[576];
+  size_t start;
+  size_t out_index = 0;
+
+  if (model == NULL || audio == NULL || speech_probabilities == NULL || speech_probabilities_written == NULL) {
+    return SILERO_VAD_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (model->input_samples != chunk_size) {
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+  if (speech_probabilities_capacity < required_probs) {
+    return SILERO_VAD_STATUS_INVALID_SHAPE;
+  }
+
+  silero_vad_model_reset(model);
+  *speech_probabilities_written = 0;
+
+  if (audio_samples == 0) {
+    return SILERO_VAD_STATUS_OK;
+  }
+
+  for (start = 0; start < audio_samples; start += window_size) {
+    size_t chunk_samples = audio_samples - start;
+    float prob = 0.0f;
+    SileroVadStatus status;
+
+    if (chunk_samples > window_size) {
+      chunk_samples = window_size;
+    }
+
+    memset(chunk, 0, sizeof(chunk));
+    memcpy(chunk, context, context_size * sizeof(float));
+    memcpy(chunk + context_size, audio + start, chunk_samples * sizeof(float));
+
+    status = silero_vad_model_forward(model, chunk, &prob);
+    if (status != SILERO_VAD_STATUS_OK) {
+      return status;
+    }
+
+    speech_probabilities[out_index++] = prob;
+    memcpy(context, chunk + (chunk_size - context_size), context_size * sizeof(float));
+  }
+
+  *speech_probabilities_written = out_index;
+  return SILERO_VAD_STATUS_OK;
+}

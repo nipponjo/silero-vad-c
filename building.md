@@ -37,15 +37,33 @@ These options appear repeatedly in the commands below:
 Use this for the broadest Windows x64 compatibility build.
 
 ```powershell
-cmake -S . -B build-windows-x64 -G "Visual Studio 18 2026" -A x64 `
+cmake -S . -B build-windows-x64-nosimd -G "Visual Studio 18 2026" -A x64 `
   -DSILERO_VAD_WEIGHT_SOURCE=jit
 
-cmake --build build-windows-x64 --config Release
+cmake --build build-windows-x64-nosimd --config Release
 ```
 
 Output:
 
-- `build-windows-x64/silero_vad.dll`
+- `build-windows-x64-nosimd/silero_vad.dll`
+
+
+### Portable SSE
+
+Use this when you want the faster x86 build and can assume SSE support.
+
+```powershell
+cmake -S . -B build-windows-x64-sse -G "Visual Studio 18 2026" -A x64 `
+  -DSILERO_VAD_WEIGHT_SOURCE=jit `
+  -DSILERO_VAD_ENABLE_SSE=ON
+
+cmake --build build-windows-x64-sse --config Release
+```
+
+Output:
+
+- `build-windows-x64-sse/silero_vad.dll`
+
 
 ### Portable x64 AVX2
 
@@ -62,6 +80,7 @@ cmake --build build-windows-x64-avx2 --config Release
 Output:
 
 - `build-windows-x64-avx2/silero_vad.dll`
+
 
 ## Linux
 

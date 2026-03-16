@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 TARGETS: dict[str, dict[str, object]] = {
     "windows-x64": {
-        "build_dir": "build-windows-x64",
+        "build_dir": "build-windows-x64-sse",
         "library": "silero_vad.dll",
         "platform": "windows",
         "arch": "x64",
@@ -41,7 +41,7 @@ TARGETS: dict[str, dict[str, object]] = {
         "build": ["--config", "Release"],
     },
     "linux-x86_64": {
-        "build_dir": "build-linux-x86_64",
+        "build_dir": "build-linux-x86_64-sse",
         "library": "silero_vad.so",
         "platform": "linux",
         "arch": "x86_64",
@@ -146,7 +146,7 @@ TARGETS: dict[str, dict[str, object]] = {
         "build": ["--config", "Release"],
     },
     "mac-x86_64": {
-        "build_dir": "build-mac-x86_64",
+        "build_dir": "build-mac-x86_64-sse",
         "library": "silero_vad.dylib",
         "platform": "macos",
         "arch": "x86_64",

@@ -14,7 +14,9 @@ The code currently focuses on the 16 kHz model path and supports both chunked in
 - Several performance optimizations are already implemented:
   - stft-conv replaced by fixed 256-point FFT
   - fused STFT to first conv path
-  - AVX2 conv and LSTM kernels for x64
+  - shared SIMD abstraction for scalar, SSE, AVX2 and NEON backends
+  - AVX2 conv and LSTM kernels for x86_64
+  - SSE conv and LSTM kernels for x86 and x86_64
   - NEON conv and LSTM kernels for arm64
 
 ## Python example
@@ -33,8 +35,8 @@ with SileroVadClib("build-windows-x64-avx2/silero_vad.dll") as model:
 
 ## Repository layout
 
-- `silero_vad.c` / `silero_vad.h`
-  - core C implementation and public API
+- `silero_vad.c` / `silero_vad.h` / `silero_vad_simd.h`
+  - core C implementation, public API, and SIMD abstraction layer
 - `export_silero_vad_weights.py`
   - exports weights from safetensors
 - `export_silero_vad_jit_weights.py`
@@ -63,12 +65,7 @@ Build and release commands are collected in:
 
 - [`building.md`](/building.md)
 
-That file includes:
-
-- Windows builds
-- Linux builds
-- macOS builds
-- release packaging commands
+That file includes: Windows builds, Linux builds, macOS builds, and release packaging commands
 
 
 ## Public API
@@ -91,8 +88,12 @@ The current full-model path is designed around 16 kHz audio and typically uses:
 
 ## Notes
 
-- Use the non-AVX2 binary as the compatibility build for older x86 CPUs.
-- Use the AVX2 binary when you want the faster x86 path.
+- x86 and x86_64 SIMD backends are now build-selectable:
+  - scalar baseline
+  - SSE with `SILERO_VAD_ENABLE_SSE=ON`
+  - AVX2 with `SILERO_VAD_ENABLE_AVX2=ON`
+- Use the baseline or SSE build as the compatibility build for older x86 and x86_64 CPUs without AVX2.
+- Use the AVX2 build when you want the faster x86_64 path on AVX2-capable CPUs.
 - `SILERO_VAD_FAST_MATH` is available, but on current tests it did not improve performance.
 - ARM builds support the NEON-optimized path when `SILERO_VAD_ENABLE_NEON=ON`.
 

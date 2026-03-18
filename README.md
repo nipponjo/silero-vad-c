@@ -33,6 +33,20 @@ with SileroVadClib("build-windows-x64-avx2/silero_vad.dll") as model:
     probs = model.forward_audio(audio)
 ```
 
+## Benchmark
+
+Full-audio benchmark on the 60-second test clip at `src/silero_vad/test/tests_data_test.wav`.
+
+| CPU              | Build                         |    t (s) |      t/d |
+| ---------------- | ----------------------------- | -------: | -------: |
+| AMD Ryzen 9 7900 | `silero-vad-windows-x64-sse`  | 0.068892 | 0.001148 |
+| AMD Ryzen 9 7900 | `silero-vad-windows-x64-avx2` | 0.058982 | 0.000983 |
+| AMD Ryzen 9 7900 | `torch.hub(onnx=False)`       | 0.447120 | 0.007452 |
+| AMD Ryzen 9 7900 | `torch.hub(onnx=True)`        | 0.257800 | 0.004297 |
+
+`t` is the inference time averaged over 10 iterations. `d` is the audio duration (here 60 seconds).
+Both native C builds are much faster than the `torch.hub` baselines on the tested machine. The AVX2 build is the fastest result here, with the SSE build close behind, and both run at well under 1% of real time for this 60-second input.
+
 ## Repository layout
 
 - `silero_vad.c` / `silero_vad.h` / `silero_vad_simd.h`

@@ -35,7 +35,7 @@ with SileroVadClib("silero-vad-windows-x64-avx2/silero_vad.dll") as model:
 
 ## Download binaries
 
-Downloaded prebuilt binaries from the [releases](https://github.com/nipponjo/silero-vad-c/releases) site, or by running `download_releases.py`.
+Download prebuilt binaries from the [releases](https://github.com/nipponjo/silero-vad-c/releases) site, or by running `download_releases.py`.
 
 This command downloads the binaries for the local system and unzips them.
 ```bash

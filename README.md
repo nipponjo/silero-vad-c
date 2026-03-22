@@ -29,7 +29,7 @@ from src.silero_vad.utils_vad import read_audio
 
 audio = read_audio("src/silero_vad/test/tests_data_test.wav", 16000)
 
-with SileroVadClib("silero-vad-windows-x64-avx2/silero_vad.dll") as model:
+with SileroVadClib("./downloads/silero-vad-linux-x86_64-avx2/silero_vad.so") as model:
     probs = model.forward_audio(audio)
 ```
 
@@ -41,7 +41,7 @@ This command downloads the binaries for the local system and unzips them.
 ```bash
 python download_releases.py --unzip
 ```
-Use `--os all` `to download all binaries, independent of the system.
+Use `--os all` to download all binaries, independent of the system.
 ```bash
 python download_releases.py --os all --unzip
 ```
